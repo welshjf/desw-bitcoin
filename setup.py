@@ -10,7 +10,7 @@ setup(
     name='DeSW-Bitcoin',
     version='0.0.1',
     py_modules=['desw_bitcoin'],
-    url='https://bitbucket.org/deginner/desw',
+    url='https://bitbucket.org/deginner/desw-bitcoin',
     license='MIT',
     classifiers=classifiers,
     author='deginner',
@@ -19,7 +19,7 @@ setup(
     setup_requires=['pytest-runner'],
     install_requires=[
         'sqlalchemy>=1.0.9',
-#        'desw>=0.0.2',
+        'desw>=0.0.2',
         'python-bitcoinrpc>=0.3',
         'pycoin>=0.62'
     ],
