@@ -6,9 +6,12 @@ To configure for use with bitcoind, call this file from
 walletnotify and blocknotify.
 """
 
-import argparse
+import threading
+import signal
+import Queue
 import json
-import sys
+import grp
+import os
 from pycoin.key.validate import is_address_valid
 from desw import CFG, models, ses, logger, process_credit, confirm_send
 
@@ -129,23 +132,6 @@ def adjust_hwbalance(available=None, total=None):
         ses.flush()
 
 
-def main(sys_args=sys.argv[1:]):
-    """
-    The main CLI entry point. Reads the command line arguments which should
-    be filled in by the calling wallet node. Handler for walletnotify and
-    blocknotify.
-    """
-    parser = argparse.ArgumentParser()
-    parser.add_argument("type")
-    parser.add_argument("data")
-    args = parser.parse_args(sys_args)
-    typ = args.type
-    if typ == 'transaction' and args.data is not None:
-        process_txn(args.data)
-    elif typ == 'block':
-        process_block()
-
-
 def process_txn(txid):
     client = create_client()
     txd = client.gettransaction(txid)
@@ -195,6 +181,97 @@ def process_block():
     except Exception as ie:
         ses.rollback()
         ses.flush()
+
+
+def txn_processor(txn_queue):
+    while True:
+        txid = txn_queue.get()
+        if txid is None:
+            break
+        process_txn(txid)
+
+def block_processor(blk_queue):
+    while True:
+        blkid = blk_queue.get()
+        if blkid is None:
+            break
+        process_block()
+
+def pipe_reader(pipe, my_net, txn_queue, blk_queue):
+    """
+    Read notification messages from an open file and dispatch them to handler
+    threads.
+
+    Supports a pipe with multiple writers, as long as writes to the pipe are
+    under PIPE_BUF (which is at least 512 bytes) to be atomic; see pipe(7).
+
+    Returns at EOF (when there are no more writers on the pipe).
+    """
+    while True:
+        line = pipe.readline()
+        if len(line) == 0:
+            break
+        try:
+            net, notify_type, data = line.split()
+        except ValueError:
+            logger.error('Bad notification %r', line)
+            continue
+        if net != my_net:
+            logger.error('Bad notification network %s', net)
+            continue
+        if notify_type == 'transaction':
+            txn_queue.put(data)
+        elif notify_type == 'block':
+            try:
+                blk_queue.put_nowait(data)
+            except Queue.Full:
+                pass
+        else:
+            logger.error('Bad notification type %s', notify_type)
+
+
+class Signal(Exception):
+    pass
+
+def sig_handler(sig, _):
+    raise Signal(sig)
+
+
+def main():
+    """
+    Entry point for the process. Creates a named pipe (if necessary) for
+    reading notifications, sets its permissions, manages threads to process
+    notifications, and repeatedly reads from the pipe.
+    """
+    my_net = NETWORK.lower()
+    pipe_file = CFG.get(my_net, 'NOTIFY_PIPE')
+    if not os.path.exists(pipe_file):
+        os.mkfifo(pipe_file)
+    os.chmod(pipe_file, mode=0620)
+    if CFG.has_option(my_net, 'NOTIFY_GROUP'):
+        group_name = CFG.get(my_net, 'NOTIFY_GROUP')
+        gid = grp.getgrnam(group_name)[2]
+        os.chown(pipe_file, os.geteuid(), gid)
+    txn_queue = Queue.Queue()
+    blk_queue = Queue.Queue(1)
+    # ^ If multiple block notifications pile up, we only need to process one
+    try:
+        signal.signal(signal.SIGHUP, sig_handler)
+        signal.signal(signal.SIGINT, sig_handler)
+        signal.signal(signal.SIGTERM, sig_handler)
+        txn_thread = threading.Thread(target=txn_processor, args=(txn_queue,))
+        blk_thread = threading.Thread(target=block_processor, args=(blk_queue,))
+        txn_thread.start()
+        blk_thread.start()
+        while True:
+            with open(pipe_file, 'rb') as pipe: # blocks until there's a writer
+                pipe_reader(pipe, my_net, txn_queue, blk_queue)
+    except Signal:
+        # Gracefully shut down threads
+        txn_queue.put(None)
+        txn_thread.join()
+        blk_queue.put(None)
+        blk_thread.join()
 
 
 if __name__ == "__main__":
